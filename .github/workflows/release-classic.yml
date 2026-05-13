@@ -1,0 +1,287 @@
+# SPDX-FileCopyrightText: 2026 Diego López León
+# SPDX-License-Identifier: LGPL-3.0-only
+
+name: Release Ethereum Classic
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: 'Upstream Nethermind tag (e.g. "1.37.2")'
+        required: true
+      cherry_picks:
+        description: 'Space-separated SHAs from upstream master to apply on top of the tag (e.g. "3e8bbfce08")'
+        required: false
+        default: ''
+      version_suffix:
+        description: 'Optional suffix appended to the version (e.g. "rc1"). Empty for stable.'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+env:
+  PACKAGE_DIR: pkg
+
+jobs:
+  build:
+    name: Build packages
+    runs-on: ubuntu-latest
+    # NU1903 / NU1904 (known transitive dependency advisories — Snappier 1.3.0 and
+    # Microsoft.AspNetCore.DataProtection 10.0.1 respectively) are promoted to build
+    # errors in upstream csprojs. Suppress them here so transitive advisories that
+    # upstream hasn't yet bumped don't block fork rebuilds — bumping the
+    # dependencies themselves is upstream's call. New advisory codes (NU19xx) will
+    # need to be appended here as they surface.
+    env:
+      NoWarn: NU1903;NU1904
+
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      package-prefix: ${{ steps.version.outputs.package-prefix }}
+      synthetic_sha: ${{ steps.synth.outputs.sha }}
+
+    steps:
+      - name: Checkout upstream Nethermind at the requested tag
+        uses: actions/checkout@v6
+        with:
+          repository: NethermindEth/nethermind
+          ref: ${{ github.event.inputs.upstream_tag }}
+          fetch-depth: 0
+
+      - name: Configure git identity + fork remote (for cherry-pick lookup)
+        run: |
+          git config user.email "actions@github.com"
+          git config user.name "GitHub Actions"
+          git remote add fork "https://github.com/${{ github.repository }}.git"
+          # Full fetch so we can resolve any SHA the user passes — release branches
+          # in the fork may not be ancestors of upstream master.
+          git fetch fork
+
+      - name: Apply cherry-picks
+        if: ${{ github.event.inputs.cherry_picks != '' }}
+        run: |
+          set -e
+          for sha in ${{ github.event.inputs.cherry_picks }}; do
+            echo "::group::cherry-pick $sha"
+            if ! git log -1 --format='  %h %s%n  by %an, %cs' "$sha"; then
+              echo "SHA $sha is not reachable in upstream or fork. Aborting." >&2
+              exit 1
+            fi
+            git cherry-pick "$sha"
+            echo "::endgroup::"
+          done
+
+      - name: Strip workflow files from the synthetic tree
+        # GitHub refuses pushes from a workflow-scoped GITHUB_TOKEN if the
+        # commit being pushed adds/modifies `.github/workflows/*.yml` (the
+        # `workflows` permission can't be granted to the default Actions
+        # token). The upstream Nethermind tag carries its own CI workflows,
+        # which our staging push would otherwise re-introduce on the fork.
+        # Strip them now — workflow files are not needed in the release
+        # binaries; they're CI infrastructure for nethermind's own pipeline.
+        # This runs even when cherry_picks is empty, since the upstream
+        # tag itself contains workflows.
+        run: |
+          if [ -d .github/workflows ]; then
+            git rm -rq .github/workflows/
+            git commit --amend --no-edit
+          fi
+
+      - name: Capture synthetic SHA
+        id: synth
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "sha8=$(git rev-parse --short=8 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Detect version
+        id: version
+        working-directory: src/Nethermind
+        run: |
+          version_prefix=$(grep -oP '(?<=<VersionPrefix>)[^<]+' Directory.Build.props)
+          suffix="${{ github.event.inputs.version_suffix }}"
+          version=$([[ -n "$suffix" ]] && echo "$version_prefix-$suffix" || echo "$version_prefix")
+          package_prefix=nethermind-etc-$version-etc-${{ steps.synth.outputs.sha8 }}
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "package-prefix=$package_prefix" >> "$GITHUB_OUTPUT"
+
+      - name: Build for Linux x64
+        run: |
+          dotnet publish src/Nethermind/Nethermind.Runner -c Release -r linux-x64 --sc \
+            -p:PublishSingleFile=true \
+            -p:IncludeAllContentForSelfExtract=true \
+            -p:DebugType=embedded \
+            -p:SourceRevisionId=${{ steps.synth.outputs.sha }} \
+            -o pub/linux-x64
+          mkdir pub/linux-x64/keystore
+          ln -sr pub/linux-x64/nethermind pub/linux-x64/Nethermind.Runner
+
+      - name: Build for Linux arm64
+        run: |
+          dotnet publish src/Nethermind/Nethermind.Runner -c Release -r linux-arm64 --sc \
+            -p:PublishSingleFile=true \
+            -p:IncludeAllContentForSelfExtract=true \
+            -p:DebugType=embedded \
+            -p:SourceRevisionId=${{ steps.synth.outputs.sha }} \
+            -o pub/linux-arm64
+          mkdir pub/linux-arm64/keystore
+          ln -sr pub/linux-arm64/nethermind pub/linux-arm64/Nethermind.Runner
+
+      - name: Build for macOS arm64
+        run: |
+          dotnet publish src/Nethermind/Nethermind.Runner -c Release -r osx-arm64 --sc \
+            -p:PublishSingleFile=true \
+            -p:IncludeAllContentForSelfExtract=true \
+            -p:DebugType=embedded \
+            -p:SourceRevisionId=${{ steps.synth.outputs.sha }} \
+            -o pub/osx-arm64
+          mkdir pub/osx-arm64/keystore
+
+      - name: Build for macOS x64
+        run: |
+          dotnet publish src/Nethermind/Nethermind.Runner -c Release -r osx-x64 --sc \
+            -p:PublishSingleFile=true \
+            -p:IncludeAllContentForSelfExtract=true \
+            -p:DebugType=embedded \
+            -p:SourceRevisionId=${{ steps.synth.outputs.sha }} \
+            -o pub/osx-x64
+          mkdir pub/osx-x64/keystore
+
+      - name: Build for Windows x64
+        run: |
+          dotnet publish src/Nethermind/Nethermind.Runner -c Release -r win-x64 --sc \
+            -p:PublishSingleFile=true \
+            -p:IncludeAllContentForSelfExtract=true \
+            -p:DebugType=embedded \
+            -p:SourceRevisionId=${{ steps.synth.outputs.sha }} \
+            -o pub/win-x64
+          mkdir pub/win-x64/keystore
+
+      - name: Archive packages
+        run: |
+          mkdir "$PACKAGE_DIR"
+          (cd pub/linux-x64   && zip -ry "$GITHUB_WORKSPACE/$PACKAGE_DIR/${{ steps.version.outputs.package-prefix }}-linux-x64.zip"   .)
+          (cd pub/linux-arm64 && zip -ry "$GITHUB_WORKSPACE/$PACKAGE_DIR/${{ steps.version.outputs.package-prefix }}-linux-arm64.zip" .)
+          (cd pub/osx-arm64   && zip -r  "$GITHUB_WORKSPACE/$PACKAGE_DIR/${{ steps.version.outputs.package-prefix }}-macos-arm64.zip" .)
+          (cd pub/osx-x64     && zip -r  "$GITHUB_WORKSPACE/$PACKAGE_DIR/${{ steps.version.outputs.package-prefix }}-macos-x64.zip"   .)
+          (cd pub/win-x64     && zip -r  "$GITHUB_WORKSPACE/$PACKAGE_DIR/${{ steps.version.outputs.package-prefix }}-windows-x64.zip" .)
+
+      - name: Create annotated tag via GitHub API
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_TAG: ${{ github.event.inputs.upstream_tag }}
+        run: |
+          set -e
+          TAG="v${{ steps.version.outputs.version }}-etc"
+          SYNTH="${{ steps.synth.outputs.sha }}"
+          REPO="${{ github.repository }}"
+
+          # The synthetic commit needs to live in the fork's object DB before
+          # we can build a tag object that points to it. Push it to a non-branch
+          # ref so it doesn't show up in `git branch -r` listings and doesn't
+          # trigger any branch-related workflows.
+          git push -f \
+            "https://x-access-token:$GH_TOKEN@github.com/$REPO.git" \
+            "$SYNTH:refs/release-staging/$TAG"
+
+          # Create an annotated tag object via the GitHub API. Note: tags
+          # created this way are NOT signed — GitHub does not sign tags
+          # created via REST for GITHUB_TOKEN/GitHub-App identities, and
+          # there is no API parameter to request signing (community
+          # discussion github.com/orgs/community/discussions/27016 confirms
+          # this and gives the recommended workaround: import a GPG key as
+          # a secret and use `git tag -s` if Verified is required).
+          # `tagger` is required by the API for annotated tags.
+          TAGGER_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          TAG_OBJ=$(gh api -X POST "repos/$REPO/git/tags" \
+            -f "tag=$TAG" \
+            -f "message=Release $TAG (Nethermind $UPSTREAM_TAG + ETC cherry-picks)" \
+            -f "object=$SYNTH" \
+            -f "type=commit" \
+            -f "tagger[name]=github-actions[bot]" \
+            -f "tagger[email]=41898282+github-actions[bot]@users.noreply.github.com" \
+            -f "tagger[date]=$TAGGER_DATE" \
+            --jq '.sha')
+
+          # Move the `refs/tags/<TAG>` ref to point at the new tag object.
+          # PATCH-with-force updates the ref in place, which AVOIDS dissociating
+          # any existing GitHub Release tied to this tag. (DELETE+POST would
+          # turn an associated release into a "Draft" / "Untagged" state and
+          # break the release step downstream by orphaning the release record.)
+          if ! gh api -X PATCH "repos/$REPO/git/refs/tags/$TAG" \
+                 -f "sha=$TAG_OBJ" \
+                 -F "force=true" >/dev/null 2>&1; then
+            # Ref doesn't exist yet — create it.
+            gh api -X POST "repos/$REPO/git/refs" \
+              -f "ref=refs/tags/$TAG" \
+              -f "sha=$TAG_OBJ"
+          fi
+
+          # Clean up the staging ref — the synthetic commit is now reachable
+          # via the tag, so the staging ref is no longer needed.
+          git push \
+            "https://x-access-token:$GH_TOKEN@github.com/$REPO.git" \
+            ":refs/release-staging/$TAG" 2>/dev/null || true
+
+      - name: Generate release notes
+        id: notes
+        env:
+          UPSTREAM_TAG: ${{ github.event.inputs.upstream_tag }}
+          CHERRY_PICKS: ${{ github.event.inputs.cherry_picks }}
+        run: |
+          set -e
+          # For each cherry-picked SHA, emit "- <subject>" and let `sed`
+          # convert the `(#NNNN)` suffix that squash-merges leave behind
+          # into a clickable markdown link. No appended duplicate.
+          if [ -n "$CHERRY_PICKS" ]; then
+            DELTA=$(
+              for sha in $CHERRY_PICKS; do
+                git log -1 --format='- %s' "$sha"
+              done | sed -E 's|#([0-9]+)|[#\1](https://github.com/NethermindEth/nethermind/pull/\1)|g'
+            )
+          else
+            DELTA="(none — equivalent to upstream \`$UPSTREAM_TAG\`)"
+          fi
+
+          # Write notes to workspace root so the release step (which `cd`s into
+          # $PACKAGE_DIR) can reference it via absolute path.
+          # Note: GitHub-flavored Markdown in release notes treats every newline
+          # inside a paragraph as a hard <br>. Keep each paragraph on ONE line
+          # in the source heredoc so the GitHub renderer can wrap naturally.
+          cat > "$GITHUB_WORKSPACE/notes.md" <<EOF
+          Self-contained build of Nethermind \`$UPSTREAM_TAG\` carrying the following cherry-picks on top of the upstream tag:
+
+          $DELTA
+
+          ## Platforms
+
+          Linux x64 · Linux arm64 · macOS arm64 · macOS x64 · Windows x64
+          EOF
+
+      - name: Create or replace GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_TAG: ${{ github.event.inputs.upstream_tag }}
+        run: |
+          set -e
+          cd "$PACKAGE_DIR"
+          TAG="v${{ steps.version.outputs.version }}-etc"
+          REPO="${{ github.repository }}"
+
+          # Delete any existing release for this tag (Draft, Untagged, or
+          # published — `gh release delete` handles all three uniformly).
+          # The tag ref itself is left intact because --cleanup-tag defaults
+          # to false; our signed tag created earlier survives.
+          gh release delete "$TAG" --repo "$REPO" --yes 2>/dev/null || true
+
+          gh release create "$TAG" \
+            --repo "$REPO" \
+            --title "v${{ steps.version.outputs.version }}-etc (Nethermind $UPSTREAM_TAG + cherry-picks)" \
+            --notes-file "$GITHUB_WORKSPACE/notes.md" \
+            *.zip
